@@ -35,3 +35,13 @@ Load the kernel module:
 Run the script (set the appropriate device, v4l2 output device, etc.):
 
     ./gstreamer_replace.py
+
+## Result
+
+Not that great (yet), but it's much better than Zoom's result.
+
+![Result](https://raw.githubusercontent.com/floft/gstreamer-background-replace/master/files/screenshot.png)
+
+Compare that with Zoom's result:
+
+![Zoom Background](https://raw.githubusercontent.com/floft/gstreamer-background-replace/master/files/zoom_screenshot.png)
