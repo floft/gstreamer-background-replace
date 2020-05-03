@@ -5,6 +5,10 @@ GStreamer Background Replace
 Zoom on Linux has poor virtual background support (unless you have a solid
 backdrop), so instead route through GStreamer/Python and replace the background
 using a pre-trained semantic segmentation neural net.
+
+Useful docs:
+https://gstreamer.freedesktop.org/documentation/gstreamer/gi-index.html?gi-language=python
+https://lazka.github.io/pgi-docs/Gst-1.0/index.html
 """
 import os
 import time
@@ -359,8 +363,17 @@ class BackgroundReplacement:
         #
         if filename is not None and filename != "":
             launch_str = "filesrc location=\"" + filename + "\" ! decodebin"
+
+            # Otherwise it'll play everything as fast as it can and not at the
+            # speed of the video
+            sync = True
         else:
             launch_str = "v4l2src device=\"" + device + "\" ! jpegdec"
+
+            # Send to v4l2 whenever we have a frame. We don't really care about
+            # the specified framerate here -- we really just want to get and
+            # process frames from the webcam as fast as it gives them to us.
+            sync = False
 
         launch_str += " ! videobox autocrop=true " \
             "! video/x-raw," \
@@ -377,7 +390,7 @@ class BackgroundReplacement:
         self.load_pipe = Gst.parse_launch(launch_str)
 
         self.appsink = self.load_pipe.get_by_name("appsink")
-        self.appsink.set_property("sync", False)
+        self.appsink.set_property("sync", sync)
         self.appsink.set_property("drop", True)
         self.appsink.set_property("emit-signals", True)
         self.appsink.connect("new-sample", lambda x: self.process_frame(x))
@@ -447,7 +460,8 @@ class BackgroundReplacement:
             frame = self.process(frame)
 
             # Then output the processed frame
-            self.gst_next_frame(frame)
+            self.gst_next_frame(frame, buf.dts, buf.duration, buf.offset,
+                buf.offset_end, buf.pts)
         finally:
             buf.unmap(mapinfo)
 
@@ -582,10 +596,18 @@ class BackgroundReplacement:
             loop.quit()
         return True
 
-    def gst_next_frame(self, frame):
+    def gst_next_frame(self, frame, dts, duration, offset, offset_end, pts):
         """ When we have a new numpy array RGB image, push it to GStreamer """
         data = frame.tobytes()
         buf = Gst.Buffer.new_wrapped(data)
+
+        # Copy time information from when the webcam frame was captured
+        buf.dts = dts
+        buf.duration = duration
+        buf.offset = offset
+        buf.offset_end = offset_end
+        buf.pts = pts
+
         self.appsrc.emit("push-buffer", buf)
 
     def _gst_run(self, pipe, loop):
