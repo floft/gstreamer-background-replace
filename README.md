@@ -31,7 +31,7 @@ Load the kernel module:
 
 Run the script (set the appropriate device, v4l2 output device, etc.):
 
-    ./gstreamer_replace.py --device="/dev/video7"
+    ./gstreamer_replace.py --input_device="/dev/video0" --output_device="/dev/video7"
 
 Or, see *run.sh* for a full example.
 
