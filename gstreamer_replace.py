@@ -9,12 +9,14 @@ import os
 import time
 import tarfile
 import threading
-
 import numpy as np
+import tensorflow as tf
+
+from absl import app
+from absl import flags
 from collections import deque
 from PIL import Image
 from six.moves import urllib
-from scipy.ndimage.filters import gaussian_filter
 
 # Gstreamer
 import gi
@@ -23,10 +25,22 @@ gi.require_version('GLib', '2.0')
 gi.require_version('GObject', '2.0')
 from gi.repository import GLib, GObject, Gst
 
-# This code was for TF 1.x and I think the model is trained on that too?
-# https://www.tensorflow.org/guide/migrate
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
+FLAGS = flags.FLAGS
+
+flags.DEFINE_string("filename", "", "Input filename, if specified will read this rather than the V4L2 input_device")
+flags.DEFINE_string("input_device", "", "Input V4L2 device, e.g. /dev/video0")
+flags.DEFINE_string("output_device", "", "Output V4L2 device from the v4l2loopback driver, if not specified then outputs with GStreamer")
+flags.DEFINE_string("background", "", "Background image, if desired (otherwise it's just a black background)")
+flags.DEFINE_integer("output_width", 1280, "Desired output width, will crop/pad to this if smaller/larger than webcam output")
+flags.DEFINE_integer("output_height", 720, "Desired output height, will crop/pad to this if smaller/larger than webcam output")
+flags.DEFINE_integer("framerate", 30, "Desired output framerate (not sure this matters)")
+flags.DEFINE_float("color_temp", 0.433333, "Whitebalance -- adjust color temperature (0-1)")
+flags.DEFINE_float("green_tint", 0.133333, "Whitebalance -- adjust green tint (0-1)")
+flags.DEFINE_float("vignette_size", 1.0, "Vignette size (size of unaffected circle in center) -- 0 = everything black, 1 = no vignette")
+flags.DEFINE_float("vignette_soft", 1.0, "Vignette soft -- 0 = completely hard edge, 1 = no vignette")
+flags.DEFINE_boolean("blur", False, "Whether to blur the foreground/background mask -- slower")
+flags.DEFINE_boolean("debug", False, "Whether to output FPS information")
+flags.DEFINE_boolean("lite", True, "Whether to use the TF lite model (faster)")
 
 
 def load_model(model_name='mobilenetv2_coco_voctrainaug'):
@@ -184,18 +198,46 @@ class DeepLabModelLite:
         self.input_tensor = self.input_details[0]['index']
         self.output_tensor = self.output_details[0]['index']
 
+    @tf.function
+    def pre_process(self, image):
+        # Convert to float
+        # image = (np.float32(image) - 127.5) / 127.5
+        image = (tf.cast(image, dtype=tf.float32) - 127.5) / 127.5
+
+        # Expand dimensions since the model expects images to have shape:
+        #   [1, height, width, 3]
+        if len(image.shape) == 3:
+            # image = np.expand_dims(image, axis=0)
+            image = tf.expand_dims(image, axis=0)
+        else:
+            assert len(image.shape) == 4, "should have HWC or NHWC (where N=1)"
+
+        return image
+
+    @tf.function
+    def post_process(self, batch):
+        result = batch[0]
+
+        # This outputs 257x257x21 whereas the non-TF lite one outputs an
+        # int I think? So, convert to the values being the class label not
+        # a softmax sort of thing.
+        #
+        # Also, convert/round to int8 (# classes i.e. 21 << 256 values)
+        # result = np.argmax(result, axis=-1).astype(np.uint8)
+        result = tf.cast(tf.argmax(result, axis=-1), dtype=tf.uint8)
+
+        return result
+
     def run(self, image):
         """ Runs inference on a single image.
 
         Args: a numpy array already at the correct size
         Returns: seg_map: Segmentation map of `resized_image`.
         """
-        # Convert to float
-        image = (np.float32(image) - 127.5) / 127.5
+        image = self.pre_process(image)
 
-        # Expand dimensions since the model expects images to have shape:
-        #   [1, height, width, 3]
-        image = np.expand_dims(image, axis=0)
+        # TF Lite set_tensor requires it be a np.float32, not tf.float32
+        image = image.numpy()
 
         # Run data through model
         self.interpreter.set_tensor(self.input_tensor, image)
@@ -204,16 +246,8 @@ class DeepLabModelLite:
         # The function `get_tensor()` returns a copy of the tensor data.
         # Use `tensor()` in order to get a pointer to the tensor.
         batch = self.interpreter.get_tensor(self.output_tensor)
-        result = batch[0]
 
-        # This outputs 257x257x21 whereas the non-TF lite one outputs an
-        # int I think? So, convert to the values being the class label not
-        # a softmax sort of thing.
-        #
-        # Also, convert/round to int8 (# classes i.e. 21 << 256 values)
-        result = np.argmax(result, axis=-1).astype(np.uint8)
-
-        return result
+        return self.post_process(batch)
 
     def gst_shape(self, width, height):
         """ Different than DeepLabModel """
@@ -249,18 +283,42 @@ def round_to_even(val):
     return 2 * round(val / 2)
 
 
+def calc_gaussian_blur_kernel(num_channels=3, kernel_size=7, sigma=5):
+    """ From: https://gist.github.com/blzq/c87d42f45a8c5a53f5b393e27b1f5319 """
+    def gauss_kernel(channels, kernel_size, sigma):
+        ax = tf.range(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
+        xx, yy = tf.meshgrid(ax, ax)
+        kernel = tf.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+        kernel = kernel / tf.reduce_sum(kernel)
+        kernel = tf.tile(kernel[..., tf.newaxis], [1, 1, channels])
+        return kernel
+
+    gaussian_kernel = gauss_kernel(num_channels, kernel_size, sigma)
+    return gaussian_kernel[..., tf.newaxis]
+
+
+def gaussian_blur(img, gaussian_kernel):
+    # Expand to have batch dimension
+    img = tf.expand_dims(img, axis=0)
+    blurred = tf.nn.depthwise_conv2d(img, gaussian_kernel, [1, 1, 1, 1],
+        padding="SAME")
+    # Get rid of batch dimension
+    return blurred[0]
+
+
 class BackgroundReplacement:
     """ Wrap model to calculate FPS and run in GStreamer
 
     See: https://github.com/floft/vision-landing/blob/master/object_detector.py
     """
     def __init__(self, average_fps_frames=30, debug=False, lite=False,
-            gst_width=854, gst_height=480, gst_framerate=30,
-            gst_display_width=854, green_tint=0.04, color_temp=0.7,
-            crop_top=120, crop_bottom=120, crop_left=213, crop_right=213,
-            filename=None, device=None, v4l2outputdevice=None):
+            output_width=1280, output_height=720, framerate=30,
+            green_tint=0.133333, color_temp=0.433333, filename=None,
+            vignette_size=1, vignette_soft=1, background=None, blur=False,
+            device="/dev/video0", v4l2outputdevice=None):
         self.debug = debug
         self.lite = lite
+        self.blur = blur
         self.exiting = False
 
         assert filename is not None or device is not None, \
@@ -273,12 +331,30 @@ class BackgroundReplacement:
 
         # GStreamer can't resize to all shapes exactly, so we may pad it
         # a couple pixels.
-        self.gst_width = gst_width
-        self.gst_height = gst_height
+        self.gst_width = output_width
+        self.gst_height = output_height
         self.gst_model_width, self.gst_model_height = self.model.gst_shape(
-            gst_width, gst_height)
+            output_width, output_height)
         self.true_model_width, self.true_model_height = self.model.true_model_shape(
-            gst_width, gst_height)
+            output_width, output_height)
+
+        # Pre-compute for later
+        self.gaussian_kernel = calc_gaussian_blur_kernel(num_channels=1)
+        self.alpha_channel = tf.cast(tf.ones((output_height, output_width, 1))*255, dtype=tf.uint8)
+
+        # Get the background, if specified
+        self.background_image = None
+
+        if background is not None and background != "":
+            # Resize/crop/pad to forground size
+            self.background_image = np.array(Image.open(background))
+            self.background_image = tf.cast(tf.image.resize_with_crop_or_pad(
+                self.background_image, output_height, output_width),
+                dtype=tf.float32).numpy()
+
+            # Drop the alpha channel, e.g. if from a png image
+            if self.background_image.shape[-1] == 4:
+                self.background_image = self.background_image[:, :, :-1]
 
         # compute average FPS over # of frames
         self.fps = deque(maxlen=average_fps_frames)
@@ -296,22 +372,22 @@ class BackgroundReplacement:
         #
         # Get the input frames
         #
-        if filename is not None:
+        if filename is not None and filename != "":
             launch_str = "filesrc location=\"" + filename + "\" ! decodebin"
         else:
-            launch_str = "v4l2src device=\"" + device + "\" " \
-                "! jpegdec ! videocrop top=" + str(crop_top) + " " \
-                "left=" + str(crop_left) + " right=" + str(crop_right) + " " \
-                "bottom=" + str(crop_bottom)
+            launch_str = "v4l2src device=\"" + device + "\" ! jpegdec"
 
-        launch_str += " ! videoconvert ! videoscale " \
-            "! video/x-raw,format=RGBA," \
-            "width=" + str(self.gst_width) + "," \
-            "height=" + str(self.gst_height) + " " \
+        launch_str += " ! videobox autocrop=true " \
+            "! video/x-raw," \
+            "width=" + str(output_width) + "," \
+            "height=" + str(output_height) + " " \
+            "! videoconvert ! videoscale " \
+            "! video/x-raw,format=RGBA " \
             "! frei0r-filter-white-balance green-tint=" + str(green_tint) + " " \
             "! frei0r-filter-white-balance--lms-space- " \
             "color-temperature=" + str(color_temp) + " " \
-            "! frei0r-filter-vignette clearcenter=0.4 soft=0.6 " \
+            "! frei0r-filter-vignette clearcenter=" + str(vignette_size) + " " \
+            "soft=" + str(vignette_soft) + " " \
             "! appsink name=appsink"
         self.load_pipe = Gst.parse_launch(launch_str)
 
@@ -329,19 +405,16 @@ class BackgroundReplacement:
         # it errors, so we end up converting multiple times.
         launch_str = "appsrc name=appsrc " \
             "! video/x-raw,format=RGBA," \
-            "width=" + str(self.gst_width) + "," \
-            "height=" + str(self.gst_height) + "," \
-            "framerate=" + str(gst_framerate) + "/1 " \
-            "! videoconvert ! videoscale " \
-            "! video/x-raw,format=YUY2," \
-            "width=" + str(self.gst_width) + "," \
-            "height=" + str(self.gst_height)
+            "width=" + str(output_width) + "," \
+            "height=" + str(output_height) + "," \
+            "framerate=" + str(framerate) + "/1," \
+            "interlace-mode=progressive " \
+            "! videoconvert ! video/x-raw,format=YUY2 ! " \
 
-        if v4l2outputdevice is not None:
-            launch_str += ",interlace-mode=progressive " \
-                "! v4l2sink device=\"" + v4l2outputdevice + "\""
+        if v4l2outputdevice is not None and v4l2outputdevice != "":
+            launch_str += "v4l2sink device=\"" + v4l2outputdevice + "\""
         else:
-            launch_str += " ! videoconvert ! autovideosink"
+            launch_str += "videoconvert ! autovideosink"
 
         self.display_pipe = Gst.parse_launch(launch_str)
         self.appsrc = self.display_pipe.get_by_name("appsrc")
@@ -423,48 +496,59 @@ class BackgroundReplacement:
         # https://docs.scipy.org/doc/scipy-1.2.0/reference/generated/scipy.misc.imresize.html
         return np.array(Image.fromarray(np_array).resize((width, height)))
 
-    def segment(self, np_image):
+    @tf.function
+    def segment_pre_process(self, np_image):
         # Drop alpha channel
         np_image = np_image[:, :, :-1]
 
-        # Shrink
-        np_image_small = self.resize(np_image,
-            self.true_model_width, self.true_model_height)
+        # Resize to shape that we can input to the model, and do it fast
+        np_image_small = tf.image.resize(np_image,
+            (self.true_model_height, self.true_model_width),
+            method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
 
-        # Pad to correct shape
-        np_image_small = self.pad_to(
-            np_image_small, self.true_model_width, self.true_model_height)
+        return np_image, np_image_small
+
+    @tf.function
+    def segment_post_process(self, np_image, seg_map):
+        # Zero the background for now
+        mask = tf.cast(seg_map != 0, dtype=tf.float32)
+        mask = tf.expand_dims(mask, axis=-1)  # it's one channel
+
+        # Blur
+        if self.blur:
+            mask = gaussian_blur(mask, self.gaussian_kernel)
+
+        # Scale up alpha to match image shape
+        output_height, output_width, _ = np_image.shape
+        alpha = tf.image.resize(mask, (output_height, output_width),
+            method=tf.image.ResizeMethod.BILINEAR, antialias=True)
+
+        # Replace background
+        if self.background_image is None:
+            np_image = tf.cast(np_image, dtype=tf.float32) * alpha
+        else:
+            np_image = tf.cast(np_image, dtype=tf.float32) * alpha \
+                + (1 - alpha) * self.background_image
+
+        # Clip to 0-255 and cast to uint
+        np_image = tf.cast(tf.clip_by_value(np_image, 0, 255), dtype=tf.uint8)
+
+        # Add in alpha channel
+        return tf.concat([np_image, self.alpha_channel], axis=-1)
+
+    def segment(self, np_image):
+        # Pre-process
+        np_image, np_image_small = self.segment_pre_process(np_image)
 
         # Run through model
         seg_map = self.model.run(np_image_small)
 
-        # Zero the background for now
-        mask = (seg_map != 0).astype(np.float32)  # 0: background, so everything else
+        # Post-process
+        np_image = self.segment_post_process(np_image, seg_map)
 
-        # Change alpha, but not totally black
-        mask = gaussian_filter(mask, sigma=2)
-
-        # New shape: (height, width, 3)
-        alpha = np.repeat(np.expand_dims(mask, axis=-1), 3, axis=-1)
-
-        # # Scale up alpha to match image shape
-        output_height, output_width, _ = np_image.shape
-        alpha_large = self.resize((alpha * 255).astype(np.uint8), output_width, output_height)
-        alpha_large = (alpha_large / 255).astype(np.float32)
-
-        # Crop to the output shape (if we padded by 1px for example)
-        # np_image = np_image[0:self.gst_model_height, 0:self.gst_model_height]
-
-        # Multiply
-        np_image = (np_image.astype(np.float32) * alpha_large).astype(np.uint8)
-
-        # Add in alpha channel, since otherwise we get completely green output?
-        # https://stackoverflow.com/a/39643014
-        np_image = np.dstack(
-            (np_image, np.ones((output_height, output_width))*255))
-
-        # Output is expected to be uint8
-        return np_image.astype(np.uint8)
+        # Output is expected to be
+        # return np_image.astype(np.uint8)
+        return np_image.numpy()
 
     def process(self, *args, **kwargs):
         if self.debug:
@@ -549,15 +633,32 @@ class BackgroundReplacement:
         self.t_gst_display.join()
 
 
-if __name__ == "__main__":
-    # On video
-    # br = BackgroundReplacement(filename="test.avi", debug=True, lite=True)
+def main(argv):
+    otherargs = {
+        "output_width": FLAGS.output_width,
+        "output_height": FLAGS.output_height,
+        "framerate": FLAGS.framerate,
+        "green_tint": FLAGS.green_tint,
+        "color_temp": FLAGS.color_temp,
+        "vignette_size": FLAGS.vignette_size,
+        "vignette_soft": FLAGS.vignette_soft,
+        "blur": FLAGS.blur,
+        "background": FLAGS.background,
+        "debug": FLAGS.debug,
+        "lite": FLAGS.lite,
+    }
 
-    # On live webcam images
-    # br = BackgroundReplacement(device="/dev/video2", debug=True, lite=True)
-
-    # On live webcam images and output to virtual V4L2 device
-    br = BackgroundReplacement(device="/dev/video2",
-        v4l2outputdevice="/dev/video7", debug=True, lite=True)
+    if FLAGS.filename != "":
+        # On video
+        br = BackgroundReplacement(filename=FLAGS.filename, **otherargs)
+    else:
+        # On live webcam images and output to virtual V4L2 device (if specified)
+        # or if not then GStreamer output window
+        br = BackgroundReplacement(device=FLAGS.input_device,
+            v4l2outputdevice=FLAGS.output_device, **otherargs)
 
     br.run()
+
+
+if __name__ == "__main__":
+    app.run(main)
