@@ -12,7 +12,9 @@ GoPro view, add a slight vignette, etc.
 If you want to output this as a virtual/fake webcam on Linux, e.g. to use in
 Zoom, Hangouts, Messenger, etc. then install
 [v4l2loopback](https://github.com/umlaeute/v4l2loopback), for example if on Arch
-with the AUR package [v4l2loopback-dkms](https://aur.archlinux.org/packages/v4l2loopback-dkms/) (though make sure you have *linux-headers* installed as well, or else dkms won't build it for your kernel).
+with the AUR package [v4l2loopback-dkms](https://aur.archlinux.org/packages/v4l2loopback-dkms/)
+(though make sure you have *linux-headers* installed as well, or else dkms won't
+build it for your kernel).
 
 Then, gstreamer 1.0 with good/bad plugins, TensorFlow, Numpy, SciPy, and abseil-py (absl-py).
 

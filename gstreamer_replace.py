@@ -11,18 +11,18 @@ import tarfile
 import threading
 import numpy as np
 import tensorflow as tf
+import urllib.request
 
 from absl import app
 from absl import flags
 from collections import deque
 from PIL import Image
-from six.moves import urllib
 
 # Gstreamer
 import gi
-gi.require_version('Gst', '1.0')
-gi.require_version('GLib', '2.0')
-gi.require_version('GObject', '2.0')
+gi.require_version("Gst", "1.0")
+gi.require_version("GLib", "2.0")
+gi.require_version("GObject", "2.0")
 from gi.repository import GLib, GObject, Gst
 
 FLAGS = flags.FLAGS
@@ -43,40 +43,40 @@ flags.DEFINE_boolean("debug", False, "Whether to output FPS information")
 flags.DEFINE_boolean("lite", True, "Whether to use the TF lite model (faster)")
 
 
-def load_model(model_name='mobilenetv2_coco_voctrainaug'):
+def load_model(model_name="mobilenetv2_coco_voctrainaug"):
     lite = model_name == "lite"
 
-    _DOWNLOAD_URL_PREFIX = 'http://download.tensorflow.org/models/'
-    _MODEL_URLS = {
-        'mobilenetv2_coco_voctrainaug':
-            'deeplabv3_mnv2_pascal_train_aug_2018_01_29.tar.gz',
-        'mobilenetv2_coco_voctrainval':
-            'deeplabv3_mnv2_pascal_trainval_2018_01_29.tar.gz',
-        'xception_coco_voctrainaug':
-            'deeplabv3_pascal_train_aug_2018_01_04.tar.gz',
-        'xception_coco_voctrainval':
-            'deeplabv3_pascal_trainval_2018_01_04.tar.gz',
-        'lite':
-            'tflite/gpu/deeplabv3_257_mv_gpu.tflite',
+    prefix = "https://storage.googleapis.com/download.tensorflow.org/models/"
+    urls = {
+        "mobilenetv2_coco_voctrainaug":
+            "deeplabv3_mnv2_pascal_train_aug_2018_01_29.tar.gz",
+        "mobilenetv2_coco_voctrainval":
+            "deeplabv3_mnv2_pascal_trainval_2018_01_29.tar.gz",
+        "xception_coco_voctrainaug":
+            "deeplabv3_pascal_train_aug_2018_01_04.tar.gz",
+        "xception_coco_voctrainval":
+            "deeplabv3_pascal_trainval_2018_01_04.tar.gz",
+        "lite":
+            "tflite/gpu/deeplabv3_257_mv_gpu.tflite",
     }
 
     if lite:
-        download_path = 'deeplab_model.tflite'
+        download_path = "deeplab_model.tflite"
     else:
-        download_path = 'deeplab_model.tar.gz'
+        download_path = "deeplab_model.tar.gz"
 
     if not os.path.exists(download_path):
-        print('downloading model, this might take a while...')
-        urllib.request.urlretrieve(_DOWNLOAD_URL_PREFIX + _MODEL_URLS[model_name],
-                        download_path)
-        print('download completed! loading DeepLab model...')
+        print("Downloading model")
+        url = prefix + urls[model_name]
+        urllib.request.urlretrieve(url, download_path)
 
+    print("Loading model")
     if lite:
         model = DeepLabModelLite(download_path)
     else:
         model = DeepLabModel(download_path)
 
-    print('model loaded successfully!')
+    print("Model loaded")
 
     return model
 
@@ -91,11 +91,11 @@ def get_buffer_size(caps):
     """
     caps_struct = caps.get_structure(0)
 
-    (success, width) = caps_struct.get_int('width')
+    (success, width) = caps_struct.get_int("width")
     if not success:
         return False, (0, 0)
 
-    (success, height) = caps_struct.get_int('height')
+    (success, height) = caps_struct.get_int("height")
     if not success:
         return False, (0, 0)
 
@@ -105,10 +105,10 @@ def get_buffer_size(caps):
 class DeepLabModel:
     """Class to load deeplab model and run inference."""
 
-    INPUT_TENSOR_NAME = 'ImageTensor:0'
-    OUTPUT_TENSOR_NAME = 'SemanticPredictions:0'
+    INPUT_TENSOR_NAME = "ImageTensor:0"
+    OUTPUT_TENSOR_NAME = "SemanticPredictions:0"
     INPUT_SIZE = 513
-    FROZEN_GRAPH_NAME = 'frozen_inference_graph'
+    FROZEN_GRAPH_NAME = "frozen_inference_graph"
 
     def __init__(self, tarball_path):
         """Creates and loads pretrained deeplab model."""
@@ -120,18 +120,18 @@ class DeepLabModel:
         for tar_info in tar_file.getmembers():
             if self.FROZEN_GRAPH_NAME in os.path.basename(tar_info.name):
                 file_handle = tar_file.extractfile(tar_info)
-                graph_def = tf.GraphDef.FromString(file_handle.read())
+                graph_def = tf.compat.v1.GraphDef.FromString(file_handle.read())
                 break
 
         tar_file.close()
 
         if graph_def is None:
-            raise RuntimeError('Cannot find inference graph in tar archive.')
+            raise RuntimeError("Cannot find inference graph in tar archive.")
 
         with self.graph.as_default():
-            tf.import_graph_def(graph_def, name='')
+            tf.compat.v1.import_graph_def(graph_def, name="")
 
-        self.sess = tf.Session(graph=self.graph)
+        self.sess = tf.compat.v1.Session(graph=self.graph)
 
     def calc_target_size(self, size):
         width, height = size
@@ -140,22 +140,11 @@ class DeepLabModel:
         return target_size
 
     def run(self, image):
-        """Runs inference on a single image.
+        """ Runs inference on a single image.
 
-        Args:
-        image: A PIL.Image object, raw input image.
-        (or if resize=False, then a numpy array already at the correct size,
-        for when we resize within GStreamer)
-
-        Returns:
-        resized_image: RGB image resized from original input image.
-        seg_map: Segmentation map of `resized_image`.
+        Args: numpy array already at the correct size
+        Returns: Segmentation map of `resized_image`.
         """
-        # if resize:
-        #     target_size = self.calc_target_size(image.size)
-        #     resized_image = image.convert('RGB').resize(target_size, Image.ANTIALIAS)
-        #     image = np.asarray(resized_image)
-        # else:
         batch_seg_map = self.sess.run(self.OUTPUT_TENSOR_NAME,
             feed_dict={self.INPUT_TENSOR_NAME: [image]})
         seg_map = batch_seg_map[0]
@@ -194,20 +183,18 @@ class DeepLabModelLite:
         self.output_details = self.interpreter.get_output_details()
 
         # Get shapes and I/O
-        self.input_shape = self.input_details[0]['shape']
-        self.input_tensor = self.input_details[0]['index']
-        self.output_tensor = self.output_details[0]['index']
+        self.input_shape = self.input_details[0]["shape"]
+        self.input_tensor = self.input_details[0]["index"]
+        self.output_tensor = self.output_details[0]["index"]
 
     @tf.function
     def pre_process(self, image):
         # Convert to float
-        # image = (np.float32(image) - 127.5) / 127.5
         image = (tf.cast(image, dtype=tf.float32) - 127.5) / 127.5
 
         # Expand dimensions since the model expects images to have shape:
         #   [1, height, width, 3]
         if len(image.shape) == 3:
-            # image = np.expand_dims(image, axis=0)
             image = tf.expand_dims(image, axis=0)
         else:
             assert len(image.shape) == 4, "should have HWC or NHWC (where N=1)"
@@ -223,7 +210,6 @@ class DeepLabModelLite:
         # a softmax sort of thing.
         #
         # Also, convert/round to int8 (# classes i.e. 21 << 256 values)
-        # result = np.argmax(result, axis=-1).astype(np.uint8)
         result = tf.cast(tf.argmax(result, axis=-1), dtype=tf.uint8)
 
         return result
@@ -254,7 +240,6 @@ class DeepLabModelLite:
         # NxHxWxC
         # shape: 1, 257, 257, 3
         input_width = self.input_shape[2]
-        # input_height = self.input_shape[1]
 
         # Calculate
         model_width = int(input_width)
@@ -262,10 +247,6 @@ class DeepLabModelLite:
         # Need this otherwise we get reshape errors... GStreamer videoscale
         # doesn't scale to any arbitrary value, I suspect.
         model_width = round_to_even(model_width)
-
-        # model_height = int(input_height / (width / height))
-
-        # return model_width, model_height
 
         # Small, so do a square?
         return model_width, model_width
@@ -300,8 +281,11 @@ def calc_gaussian_blur_kernel(num_channels=3, kernel_size=7, sigma=5):
 def gaussian_blur(img, gaussian_kernel):
     # Expand to have batch dimension
     img = tf.expand_dims(img, axis=0)
+
+    # Do the blur
     blurred = tf.nn.depthwise_conv2d(img, gaussian_kernel, [1, 1, 1, 1],
         padding="SAME")
+
     # Get rid of batch dimension
     return blurred[0]
 
@@ -546,8 +530,7 @@ class BackgroundReplacement:
         # Post-process
         np_image = self.segment_post_process(np_image, seg_map)
 
-        # Output is expected to be
-        # return np_image.astype(np.uint8)
+        # Output is expected to be numpy array
         return np_image.numpy()
 
     def process(self, *args, **kwargs):
