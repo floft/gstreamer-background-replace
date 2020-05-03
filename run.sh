@@ -14,7 +14,7 @@ if [[ ! -e $background ]]; then
 fi
 
 echo "Starting GStreamer background replace"
-./gstreamer_replace.py --input_device="$input" --output_device="$output" \
+./main.py --input_device="$input" --output_device="$output" \
     --output_width=854 --output_height=480 --framerate=30 --green_tint=0.04 \
     --color_temp=0.7 --vignette_size=0.4 --vignette_soft=0.6 \
     --background="$background" "$@"

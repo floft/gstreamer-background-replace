@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Run replacement on live images in GStreamer
+GStreamer Background Replace
 
-I went with the TensorFlow version since I think the model is smaller and
-probably runs faster...
+Zoom on Linux has poor virtual background support (unless you have a solid
+backdrop), so instead route through GStreamer/Python and replace the background
+using a pre-trained semantic segmentation neural net.
 """
 import os
 import time
