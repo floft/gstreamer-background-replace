@@ -43,6 +43,7 @@ flags.DEFINE_float("color_temp", 0.433333, "Whitebalance -- adjust color tempera
 flags.DEFINE_float("green_tint", 0.133333, "Whitebalance -- adjust green tint (0-1)")
 flags.DEFINE_float("vignette_size", 1.0, "Vignette size (size of unaffected circle in center) -- 0 = everything black, 1 = no vignette")
 flags.DEFINE_float("vignette_soft", 1.0, "Vignette soft -- 0 = completely hard edge, 1 = no vignette")
+flags.DEFINE_boolean("low_latency", False, "Whether to have low-latency, i.e. audio matches video closely -- may drop lots of frames")
 flags.DEFINE_boolean("blur", False, "Whether to blur the foreground/background mask -- slower")
 flags.DEFINE_boolean("debug", False, "Whether to output FPS information")
 flags.DEFINE_boolean("lite", True, "Whether to use the TF lite model (faster)")
@@ -79,7 +80,9 @@ def load_model(model_name="mobilenetv2_coco_voctrainaug"):
     if lite:
         model = DeepLabModelLite(download_path)
     else:
-        model = DeepLabModel(download_path)
+        # Convert to TF Lite so it's faster...
+        model = DeepLabModelConvertToLite(download_path)
+        # model = DeepLabModel(download_path)
 
     print("Model loaded")
 
@@ -177,10 +180,15 @@ class DeepLabModelLite:
     See: https://www.tensorflow.org/lite/guide/inference
     Model from: https://www.tensorflow.org/lite/models/segmentation/overview
     """
-    def __init__(self, filename):
+    def __init__(self, filename=None, model_content=None):
         """ Creates and loads pretrained deeplab model. """
         # Load TFLite model and allocate tensors.
-        self.interpreter = tf.lite.Interpreter(model_path=filename)
+        if model_content is None:
+            assert filename is not None, "must pass tflite filename"
+            self.interpreter = tf.lite.Interpreter(model_path=filename)
+        else:
+            self.interpreter = tf.lite.Interpreter(model_content=model_content)
+
         self.interpreter.allocate_tensors()
 
         # Get input and output tensors.
@@ -192,10 +200,19 @@ class DeepLabModelLite:
         self.input_tensor = self.input_details[0]["index"]
         self.output_tensor = self.output_details[0]["index"]
 
+        # Whether it's a float or quantized model
+        if self.input_details[0]['dtype'] == np.float32:
+            self.floating_model = True
+            print("Floating-point model detected")
+        else:
+            self.floating_model = False
+            print("Quantized model detected")
+
     @tf.function
     def pre_process(self, image):
         # Convert to float
-        image = (tf.cast(image, dtype=tf.float32) - 127.5) / 127.5
+        if self.floating_model:
+            image = (tf.cast(image, dtype=tf.float32) - 127.5) / 127.5
 
         # Expand dimensions since the model expects images to have shape:
         #   [1, height, width, 3]
@@ -215,7 +232,9 @@ class DeepLabModelLite:
         # a softmax sort of thing.
         #
         # Also, convert/round to int8 (# classes i.e. 21 << 256 values)
-        result = tf.cast(tf.argmax(result, axis=-1), dtype=tf.uint8)
+        if len(result.shape) == 3:
+            result = tf.cast(tf.argmax(result, axis=-1), dtype=tf.uint8)
+        # Otherwise... it's already done this if quantized???
 
         return result
 
@@ -265,6 +284,55 @@ class DeepLabModelLite:
         return input_width, input_height
 
 
+class DeepLabModelConvertToLite(DeepLabModelLite):
+    """ Convert model to TF Lite then run"""
+
+    INPUT_TENSOR_NAME = "ImageTensor"
+    OUTPUT_TENSOR_NAME = "SemanticPredictions"
+    INPUT_SIZE = 513
+    FROZEN_GRAPH_NAME = "frozen_inference_graph"
+
+    def __init__(self, tarball_path):
+        """Creates and loads pretrained deeplab model."""
+        # Load the full model
+        frozen_pb_file = None
+        # Extract frozen graph from tar archive.
+        tar_file = tarfile.open(tarball_path)
+        for tar_info in tar_file.getmembers():
+            if self.FROZEN_GRAPH_NAME in os.path.basename(tar_info.name):
+                frozen_pb_file = tar_info.name
+                break
+
+        # Conversion requires an actual files
+        tar_file.extractall()
+        tar_file.close()
+
+        if frozen_pb_file is None:
+            raise RuntimeError("Cannot find inference graph in tar archive.")
+
+        # See: https://stackoverflow.com/a/59752911
+        converter = tf.compat.v1.lite.TFLiteConverter.from_frozen_graph(
+            frozen_pb_file,
+            input_shapes={self.INPUT_TENSOR_NAME:
+                [1, self.INPUT_SIZE, self.INPUT_SIZE, 3]},
+            input_arrays=[self.INPUT_TENSOR_NAME],
+            output_arrays=[self.OUTPUT_TENSOR_NAME])
+
+        converter.inference_type = tf.uint8
+        converter.quantized_input_stats = {self.INPUT_TENSOR_NAME: (127.5, 127.5)}
+
+        # converter.inference_input_type = tf.uint8
+        # converter.inference_output_type = tf.uint8
+
+        # converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        # converter.optimizations = [tf.lite.Optimize.OPTIMIZE_FOR_LATENCY]
+
+        model_content = converter.convert()
+
+        # Then use the TF Lite code
+        super().__init__(model_content=model_content)
+
+
 def round_to_even(val):
     return 2 * round(val / 2)
 
@@ -304,7 +372,7 @@ class BackgroundReplacement:
             output_width=1280, output_height=720, framerate=30,
             green_tint=0.133333, color_temp=0.433333, filename=None,
             vignette_size=1, vignette_soft=1, background=None, blur=False,
-            device="/dev/video0", v4l2outputdevice=None):
+            device="/dev/video0", v4l2outputdevice=None, low_latency=False):
         self.debug = debug
         self.lite = lite
         self.blur = blur
@@ -363,12 +431,14 @@ class BackgroundReplacement:
         #
         if filename is not None and filename != "":
             launch_str = "filesrc location=\"" + filename + "\" ! decodebin"
+            live = False
 
             # Otherwise it'll play everything as fast as it can and not at the
             # speed of the video
             sync = True
         else:
             launch_str = "v4l2src device=\"" + device + "\" ! jpegdec"
+            live = True
 
             # Send to v4l2 whenever we have a frame. We don't really care about
             # the specified framerate here -- we really just want to get and
@@ -393,6 +463,7 @@ class BackgroundReplacement:
         self.appsink.set_property("sync", sync)
         self.appsink.set_property("drop", True)
         self.appsink.set_property("emit-signals", True)
+        # self.appsink.set_property("max-buffers", 1)
         self.appsink.connect("new-sample", lambda x: self.process_frame(x))
 
         #
@@ -416,6 +487,14 @@ class BackgroundReplacement:
 
         self.display_pipe = Gst.parse_launch(launch_str)
         self.appsrc = self.display_pipe.get_by_name("appsrc")
+
+        if live and low_latency:
+            self.appsrc.set_property("block", False)
+            self.appsrc.set_property("is_live", True)
+            self.appsrc.set_property("duration", 1/framerate)
+
+        # Set the second pipeline's clock to the first's
+        self.display_pipe.use_clock(self.load_pipe.get_pipeline_clock())
 
         # Event loop
         self.load_loop = GLib.MainLoop()
@@ -649,6 +728,7 @@ def main(argv):
         "vignette_size": FLAGS.vignette_size,
         "vignette_soft": FLAGS.vignette_soft,
         "blur": FLAGS.blur,
+        "low_latency": FLAGS.low_latency,
         "background": FLAGS.background,
         "debug": FLAGS.debug,
         "lite": FLAGS.lite,

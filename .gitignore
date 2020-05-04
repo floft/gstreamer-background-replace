@@ -2,3 +2,5 @@
 *.avi
 *.tflite
 *.tar.*
+*ckpt-*
+*.pb

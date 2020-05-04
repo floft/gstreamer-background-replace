@@ -2,7 +2,7 @@
 # Make sure driver is loaded
 echo "Loading v4l2loopback module"
 modprobe v4l2loopback &>/dev/null || \
-    sudo modprobe v4l2loopback video_nr=7 exclusive_caps=1
+    sudo modprobe v4l2loopback video_nr=7 #exclusive_caps=1
 
 input="/dev/video2"
 output="/dev/video7"
