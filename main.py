@@ -36,14 +36,16 @@ flags.DEFINE_string("filename", "", "Input filename, if specified will read this
 flags.DEFINE_string("input_device", "", "Input V4L2 device, e.g. /dev/video0")
 flags.DEFINE_string("output_device", "", "Output V4L2 device from the v4l2loopback driver, if not specified then outputs with GStreamer")
 flags.DEFINE_string("background", "", "Background image, if desired (otherwise it's just a black background)")
-flags.DEFINE_integer("output_width", 1280, "Desired output width, will crop/pad to this if smaller/larger than webcam output")
-flags.DEFINE_integer("output_height", 720, "Desired output height, will crop/pad to this if smaller/larger than webcam output")
+flags.DEFINE_integer("output_width", 1280, "Desired output width (i.e. probably the webcam output dimensions)")
+flags.DEFINE_integer("output_height", 720, "Desired output height (i.e. probably the webcam output dimensions)")
+flags.DEFINE_integer("crop_width", 0, "Crop/pad to this if smaller/larger than webcam output, then scaled to output_width (0 = no crop)")
+flags.DEFINE_integer("crop_height", 0, "Crop/pad to this if smaller/larger than webcam output, then scaled to output_height (0 = no crop)")
 flags.DEFINE_integer("framerate", 30, "Desired output framerate (not sure this matters)")
 flags.DEFINE_float("color_temp", 0.433333, "Whitebalance -- adjust color temperature (0-1)")
 flags.DEFINE_float("green_tint", 0.133333, "Whitebalance -- adjust green tint (0-1)")
 flags.DEFINE_float("vignette_size", 1.0, "Vignette size (size of unaffected circle in center) -- 0 = everything black, 1 = no vignette")
 flags.DEFINE_float("vignette_soft", 1.0, "Vignette soft -- 0 = completely hard edge, 1 = no vignette")
-flags.DEFINE_boolean("low_latency", False, "Whether to have low-latency, i.e. audio matches video closely -- may drop lots of frames")
+flags.DEFINE_boolean("low_latency", True, "Whether to have low-latency, i.e. audio matches video more closely")
 flags.DEFINE_boolean("blur", False, "Whether to blur the foreground/background mask -- slower")
 flags.DEFINE_boolean("debug", False, "Whether to output FPS information")
 flags.DEFINE_boolean("lite", True, "Whether to use the TF lite model (faster)")
@@ -158,7 +160,7 @@ class DeepLabModel:
         seg_map = batch_seg_map[0]
         return seg_map
 
-    def gst_shape(self, width, height):
+    def true_model_shape(self, width, height):
         model_width = int(DeepLabModel.INPUT_SIZE)
 
         # Need this otherwise we get reshape errors... GStreamer videoscale
@@ -168,10 +170,6 @@ class DeepLabModel:
         model_height = int(DeepLabModel.INPUT_SIZE / (width / height))
 
         return model_width, model_height
-
-    def true_model_shape(self, width, height):
-        # Works?
-        return self.gst_shape(width, height)
 
 
 class DeepLabModelLite:
@@ -258,22 +256,6 @@ class DeepLabModelLite:
         batch = self.interpreter.get_tensor(self.output_tensor)
 
         return self.post_process(batch)
-
-    def gst_shape(self, width, height):
-        """ Different than DeepLabModel """
-        # NxHxWxC
-        # shape: 1, 257, 257, 3
-        input_width = self.input_shape[2]
-
-        # Calculate
-        model_width = int(input_width)
-
-        # Need this otherwise we get reshape errors... GStreamer videoscale
-        # doesn't scale to any arbitrary value, I suspect.
-        model_width = round_to_even(model_width)
-
-        # Small, so do a square?
-        return model_width, model_width
 
     def true_model_shape(self, width, height):
         """ The actual shape to run through the model """
@@ -369,6 +351,7 @@ class BackgroundReplacement:
     See: https://github.com/floft/vision-landing/blob/master/object_detector.py
     """
     def __init__(self, average_fps_frames=30, debug=False, lite=False,
+            crop_width=None, crop_height=None,
             output_width=1280, output_height=720, framerate=30,
             green_tint=0.133333, color_temp=0.433333, filename=None,
             vignette_size=1, vignette_soft=1, background=None, blur=False,
@@ -386,18 +369,19 @@ class BackgroundReplacement:
         else:
             self.model = load_model()
 
+        if crop_width is None or crop_width == 0:
+            crop_width = output_width
+        if crop_height is None or crop_height == 0:
+            crop_height = output_height
+
         # GStreamer can't resize to all shapes exactly, so we may pad it
         # a couple pixels.
-        self.gst_width = output_width
-        self.gst_height = output_height
-        self.gst_model_width, self.gst_model_height = self.model.gst_shape(
-            output_width, output_height)
         self.true_model_width, self.true_model_height = self.model.true_model_shape(
-            output_width, output_height)
+            crop_width, crop_height)
 
         # Pre-compute for later
         self.gaussian_kernel = calc_gaussian_blur_kernel(num_channels=1)
-        self.alpha_channel = tf.cast(tf.ones((output_height, output_width, 1))*255, dtype=tf.uint8)
+        self.alpha_channel = tf.cast(tf.ones((crop_height, crop_width, 1))*255, dtype=tf.uint8)
 
         # Get the background, if specified
         self.background_image = None
@@ -406,7 +390,7 @@ class BackgroundReplacement:
             # Resize/crop/pad to forground size
             self.background_image = np.array(Image.open(background))
             self.background_image = tf.cast(tf.image.resize_with_crop_or_pad(
-                self.background_image, output_height, output_width),
+                self.background_image, crop_height, crop_width),
                 dtype=tf.float32).numpy()
 
             # Drop the alpha channel, e.g. if from a png image
@@ -432,23 +416,14 @@ class BackgroundReplacement:
         if filename is not None and filename != "":
             launch_str = "filesrc location=\"" + filename + "\" ! decodebin"
             live = False
-
-            # Otherwise it'll play everything as fast as it can and not at the
-            # speed of the video
-            sync = True
         else:
             launch_str = "v4l2src device=\"" + device + "\" ! jpegdec"
             live = True
 
-            # Send to v4l2 whenever we have a frame. We don't really care about
-            # the specified framerate here -- we really just want to get and
-            # process frames from the webcam as fast as it gives them to us.
-            sync = False
-
         launch_str += " ! videobox autocrop=true " \
             "! video/x-raw," \
-            "width=" + str(output_width) + "," \
-            "height=" + str(output_height) + " " \
+            "width=" + str(crop_width) + "," \
+            "height=" + str(crop_height) + " " \
             "! videoconvert ! videoscale " \
             "! video/x-raw,format=RGBA " \
             "! frei0r-filter-white-balance green-tint=" + str(green_tint) + " " \
@@ -460,10 +435,10 @@ class BackgroundReplacement:
         self.load_pipe = Gst.parse_launch(launch_str)
 
         self.appsink = self.load_pipe.get_by_name("appsink")
-        self.appsink.set_property("sync", sync)
+        self.appsink.set_property("qos", True)
+        self.appsink.set_property("sync", True)
         self.appsink.set_property("drop", True)
         self.appsink.set_property("emit-signals", True)
-        # self.appsink.set_property("max-buffers", 1)
         self.appsink.connect("new-sample", lambda x: self.process_frame(x))
 
         #
@@ -474,11 +449,14 @@ class BackgroundReplacement:
         # it errors, so we end up converting multiple times.
         launch_str = "appsrc name=appsrc " \
             "! video/x-raw,format=RGBA," \
+            "width=" + str(crop_width) + "," \
+            "height=" + str(crop_height) + " " \
+            "! videoconvert ! videoscale " \
+            "! video/x-raw,format=YUY2," \
             "width=" + str(output_width) + "," \
             "height=" + str(output_height) + "," \
             "framerate=" + str(framerate) + "/1," \
-            "interlace-mode=progressive " \
-            "! videoconvert ! video/x-raw,format=YUY2 ! " \
+            "interlace-mode=progressive ! " \
 
         if v4l2outputdevice is not None and v4l2outputdevice != "":
             launch_str += "v4l2sink device=\"" + v4l2outputdevice + "\""
@@ -487,11 +465,16 @@ class BackgroundReplacement:
 
         self.display_pipe = Gst.parse_launch(launch_str)
         self.appsrc = self.display_pipe.get_by_name("appsrc")
+        self.appsrc.set_property("format", Gst.Format.TIME)
+        self.appsrc.set_property("duration", 1/framerate)
 
         if live and low_latency:
             self.appsrc.set_property("block", False)
             self.appsrc.set_property("is_live", True)
-            self.appsrc.set_property("duration", 1/framerate)
+            # So... there will be some lag I think (since we're applying a
+            # slightly later timestamp), but this at least makes it not drop
+            # 80% of the frames.
+            self.appsrc.set_property("do_timestamp", True)
 
         # Set the second pipeline's clock to the first's
         self.display_pipe.use_clock(self.load_pipe.get_pipeline_clock())
@@ -722,6 +705,8 @@ def main(argv):
     otherargs = {
         "output_width": FLAGS.output_width,
         "output_height": FLAGS.output_height,
+        "crop_width": FLAGS.crop_width,
+        "crop_height": FLAGS.crop_height,
         "framerate": FLAGS.framerate,
         "green_tint": FLAGS.green_tint,
         "color_temp": FLAGS.color_temp,

@@ -2,7 +2,8 @@
 # Make sure driver is loaded
 echo "Loading v4l2loopback module"
 modprobe v4l2loopback &>/dev/null || \
-    sudo modprobe v4l2loopback video_nr=7 #exclusive_caps=1
+    sudo modprobe v4l2loopback card_label="Virtual Webcam" \
+        video_nr=7 exclusive_caps=1
 
 input="/dev/video2"
 output="/dev/video7"
@@ -15,6 +16,8 @@ fi
 
 echo "Starting GStreamer background replace"
 ./main.py --input_device="$input" --output_device="$output" \
-    --output_width=854 --output_height=480 --framerate=30 --green_tint=0.04 \
+    --output_width=1280 --output_height=720 \
+    --crop_width=854 --crop_height=480 \
+    --framerate=30 --green_tint=0.04 \
     --color_temp=0.7 --vignette_size=0.4 --vignette_soft=0.6 \
     --background="$background" "$@"
