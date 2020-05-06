@@ -29,7 +29,7 @@ On Arch:
 
 Load the kernel module:
 
-    sudo modprobe v4l2loopback video_nr=7 exclusive_caps=1
+    sudo modprobe v4l2loopback card_label="Virtual Webcam" video_nr=7 exclusive_caps=1
 
 Run the script (set the appropriate device, v4l2 output device, etc.):
 

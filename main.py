@@ -22,6 +22,7 @@ from absl import app
 from absl import flags
 from collections import deque
 from PIL import Image
+from scipy.ndimage.filters import gaussian_filter
 
 # Gstreamer
 import gi
@@ -45,8 +46,12 @@ flags.DEFINE_float("color_temp", 0.433333, "Whitebalance -- adjust color tempera
 flags.DEFINE_float("green_tint", 0.133333, "Whitebalance -- adjust green tint (0-1)")
 flags.DEFINE_float("vignette_size", 1.0, "Vignette size (size of unaffected circle in center) -- 0 = everything black, 1 = no vignette")
 flags.DEFINE_float("vignette_soft", 1.0, "Vignette soft -- 0 = completely hard edge, 1 = no vignette")
-flags.DEFINE_boolean("low_latency", True, "Whether to have low-latency, i.e. audio matches video more closely")
+flags.DEFINE_enum("latency", "medium", ["low", "medium", "high"], "How close audio will match the video -- low may drop many frames, medium is a decent tradeoff, high is significantly delayed")
+flags.DEFINE_boolean("do_background", True, "Whether to do/skip adding background image (if false, then black background)")
+flags.DEFINE_boolean("do_process", True, "Whether to do/skip background replacement processing (if false, then only white balance, vingnette, crop, etc.")
 flags.DEFINE_boolean("blur", False, "Whether to blur the foreground/background mask -- slower")
+flags.DEFINE_boolean("numpy", False, "Run more with numpy rather than TensorFlow -- slower")
+flags.DEFINE_boolean("interactive", False, "Allow interactively changing some options at runtime")
 flags.DEFINE_boolean("debug", False, "Whether to output FPS information")
 flags.DEFINE_boolean("lite", True, "Whether to use the TF lite model (faster)")
 
@@ -206,7 +211,14 @@ class DeepLabModelLite:
             self.floating_model = False
             print("Quantized model detected")
 
-    @tf.function
+        # Use numpy if desired, otherwise compile TF versions
+        if FLAGS.numpy:
+            self.pre_process = self.np_pre_process
+            self.post_process = self.np_post_process
+        else:
+            self.pre_process = tf.function(self.pre_process)
+            self.post_process = tf.function(self.post_process)
+
     def pre_process(self, image):
         # Convert to float
         if self.floating_model:
@@ -221,7 +233,6 @@ class DeepLabModelLite:
 
         return image
 
-    @tf.function
     def post_process(self, batch):
         result = batch[0]
 
@@ -236,6 +247,34 @@ class DeepLabModelLite:
 
         return result
 
+    def np_pre_process(self, image):
+        # Convert to float
+        if self.floating_model:
+            image = (image.astype(np.float32) - 127.5) / 127.5
+
+        # Expand dimensions since the model expects images to have shape:
+        #   [1, height, width, 3]
+        if len(image.shape) == 3:
+            image = np.expand_dims(image, axis=0)
+        else:
+            assert len(image.shape) == 4, "should have HWC or NHWC (where N=1)"
+
+        return image
+
+    def np_post_process(self, batch):
+        result = batch[0]
+
+        # This outputs 257x257x21 whereas the non-TF lite one outputs an
+        # int I think? So, convert to the values being the class label not
+        # a softmax sort of thing.
+        #
+        # Also, convert/round to int8 (# classes i.e. 21 << 256 values)
+        if len(result.shape) == 3:
+            result = np.argmax(result, axis=-1).astype(np.uint8)
+        # Otherwise... it's already done this if quantized???
+
+        return result
+
     def run(self, image):
         """ Runs inference on a single image.
 
@@ -245,7 +284,8 @@ class DeepLabModelLite:
         image = self.pre_process(image)
 
         # TF Lite set_tensor requires it be a np.float32, not tf.float32
-        image = image.numpy()
+        if not FLAGS.numpy:
+            image = image.numpy()
 
         # Run data through model
         self.interpreter.set_tensor(self.input_tensor, image)
@@ -355,11 +395,17 @@ class BackgroundReplacement:
             output_width=1280, output_height=720, framerate=30,
             green_tint=0.133333, color_temp=0.433333, filename=None,
             vignette_size=1, vignette_soft=1, background=None, blur=False,
-            device="/dev/video0", v4l2outputdevice=None, low_latency=False):
+            interactive=False, do_background=True, do_process=True,
+            device="/dev/video0", v4l2outputdevice=None, latency="medium"):
         self.debug = debug
         self.lite = lite
         self.blur = blur
+        self.interactive = interactive
         self.exiting = False
+
+        # Options we can adjust at runtime
+        self.do_background = do_background
+        self.do_process_frame = do_process
 
         assert filename is not None or device is not None, \
             "must pass either filename= or device="
@@ -381,7 +427,13 @@ class BackgroundReplacement:
 
         # Pre-compute for later
         self.gaussian_kernel = calc_gaussian_blur_kernel(num_channels=1)
-        self.alpha_channel = tf.cast(tf.ones((crop_height, crop_width, 1))*255, dtype=tf.uint8)
+
+        if FLAGS.numpy:
+            self.alpha_channel = \
+                (np.ones((crop_height, crop_width, 1))*255).astype(np.uint8)
+        else:
+            self.alpha_channel = tf.cast(
+                tf.ones((crop_height, crop_width, 1))*255, dtype=tf.uint8)
 
         # Get the background, if specified
         self.background_image = None
@@ -389,6 +441,8 @@ class BackgroundReplacement:
         if background is not None and background != "":
             # Resize/crop/pad to forground size
             self.background_image = np.array(Image.open(background))
+
+            # ignore FLAGS.numpy since this is only run once
             self.background_image = tf.cast(tf.image.resize_with_crop_or_pad(
                 self.background_image, crop_height, crop_width),
                 dtype=tf.float32).numpy()
@@ -427,10 +481,11 @@ class BackgroundReplacement:
             "! videoconvert ! videoscale " \
             "! video/x-raw,format=RGBA " \
             "! frei0r-filter-white-balance green-tint=" + str(green_tint) + " " \
+            "name=greentint " \
             "! frei0r-filter-white-balance--lms-space- " \
-            "color-temperature=" + str(color_temp) + " " \
+            "color-temperature=" + str(color_temp) + " name=colortemp " \
             "! frei0r-filter-vignette clearcenter=" + str(vignette_size) + " " \
-            "soft=" + str(vignette_soft) + " " \
+            "soft=" + str(vignette_soft) + " name=vignette " \
             "! appsink name=appsink"
         self.load_pipe = Gst.parse_launch(launch_str)
 
@@ -440,6 +495,11 @@ class BackgroundReplacement:
         self.appsink.set_property("drop", True)
         self.appsink.set_property("emit-signals", True)
         self.appsink.connect("new-sample", lambda x: self.process_frame(x))
+
+        # Adjust at runtime
+        self.greentint = self.load_pipe.get_by_name("greentint")
+        self.colortemp = self.load_pipe.get_by_name("colortemp")
+        self.vignette = self.load_pipe.get_by_name("vignette")
 
         #
         # Process and then view the results
@@ -468,13 +528,19 @@ class BackgroundReplacement:
         self.appsrc.set_property("format", Gst.Format.TIME)
         self.appsrc.set_property("duration", 1/framerate)
 
-        if live and low_latency:
-            self.appsrc.set_property("block", False)
-            self.appsrc.set_property("is_live", True)
-            # So... there will be some lag I think (since we're applying a
-            # slightly later timestamp), but this at least makes it not drop
-            # 80% of the frames.
-            self.appsrc.set_property("do_timestamp", True)
+        if live:
+            # At least try to get the frame processed and displayed in a
+            # reasonable amount of time.
+            if latency == "low" or latency == "medium":
+                self.appsrc.set_property("block", False)
+                self.appsrc.set_property("is_live", True)
+
+            # But, low latency then drops tons of frames. So, allow for a bit
+            # of lag by timestampping based on the time we output to appsrc
+            # not when we actually capture the frame. This is a fairly decent
+            # tradeoff -- at least now we don't drop 80% of frames.
+            if latency == "medium":
+                self.appsrc.set_property("do_timestamp", True)
 
         # Set the second pipeline's clock to the first's
         self.display_pipe.use_clock(self.load_pipe.get_pipeline_clock())
@@ -486,6 +552,14 @@ class BackgroundReplacement:
         # Get error messages or end of stream on bus
         self._monitor_errors(self.load_pipe, self.load_loop)
         self._monitor_errors(self.display_pipe, self.display_loop)
+
+        # Use numpy if desired, otherwise compile TF versions
+        if FLAGS.numpy:
+            self.segment_pre_process = self.np_segment_pre_process
+            self.segment_post_process = self.np_segment_post_process
+        else:
+            self.segment_pre_process = tf.function(self.segment_pre_process)
+            self.segment_post_process = tf.function(self.segment_post_process)
 
     def _monitor_errors(self, pipe, loop):
         bus = pipe.get_bus()
@@ -557,7 +631,6 @@ class BackgroundReplacement:
         # https://docs.scipy.org/doc/scipy-1.2.0/reference/generated/scipy.misc.imresize.html
         return np.array(Image.fromarray(np_array).resize((width, height)))
 
-    @tf.function
     def segment_pre_process(self, np_image):
         # Drop alpha channel
         np_image = np_image[:, :, :-1]
@@ -569,14 +642,14 @@ class BackgroundReplacement:
 
         return np_image, np_image_small
 
-    @tf.function
-    def segment_post_process(self, np_image, seg_map):
+    def segment_post_process(self, np_image, seg_map, blur=False,
+            do_background=True):
         # Zero the background for now
         mask = tf.cast(seg_map != 0, dtype=tf.float32)
         mask = tf.expand_dims(mask, axis=-1)  # it's one channel
 
         # Blur
-        if self.blur:
+        if blur:
             mask = gaussian_blur(mask, self.gaussian_kernel)
 
         # Scale up alpha to match image shape
@@ -585,7 +658,7 @@ class BackgroundReplacement:
             method=tf.image.ResizeMethod.BILINEAR, antialias=True)
 
         # Replace background
-        if self.background_image is None:
+        if not do_background or self.background_image is None:
             np_image = tf.cast(np_image, dtype=tf.float32) * alpha
         else:
             np_image = tf.cast(np_image, dtype=tf.float32) * alpha \
@@ -597,18 +670,69 @@ class BackgroundReplacement:
         # Add in alpha channel
         return tf.concat([np_image, self.alpha_channel], axis=-1)
 
+    def np_segment_pre_process(self, np_image):
+        # Drop alpha channel
+        np_image = np_image[:, :, :-1]
+
+        # Resize to shape that we can input to the model, and do it fast
+        np_image_small = self.resize(np_image, self.true_model_width,
+            self.true_model_height)
+
+        return np_image, np_image_small
+
+    def np_segment_post_process(self, np_image, seg_map, blur=False,
+            do_background=True):
+        # Zero the background for now
+        mask = (seg_map != 0).astype(np.float32)
+        mask = np.expand_dims(mask, axis=-1)  # it's one channel
+
+        # Blur
+        if blur:
+            mask = gaussian_filter(mask, sigma=2)
+
+        # Scale up alpha to match image shape
+        output_height, output_width, _ = np_image.shape
+        alpha = np.repeat(mask, 3, axis=-1)  # (height, width, 3)
+        alpha = self.resize((alpha*255).astype(np.uint8), output_width, output_height)
+        # Get back the one channel, convert to float -- (height, width, 1)
+        alpha = (np.expand_dims(alpha[:, :, 0], axis=-1)/255).astype(np.float32)
+
+        # Replace background
+        if not do_background or self.background_image is None:
+            np_image = np_image.astype(np.float32) * alpha
+        else:
+            np_image = np_image.astype(np.float32) * alpha \
+                + (1 - alpha) * self.background_image
+
+        # Cast to uint
+        np_image = np_image.astype(np.uint8)
+
+        # Add in alpha channel
+        return np.concatenate([np_image, self.alpha_channel], axis=-1)
+
     def segment(self, np_image):
-        # Pre-process
-        np_image, np_image_small = self.segment_pre_process(np_image)
+        if self.do_process_frame:
+            # Pre-process
+            np_image, np_image_small = self.segment_pre_process(np_image)
 
-        # Run through model
-        seg_map = self.model.run(np_image_small)
+            # Run through model
+            seg_map = self.model.run(np_image_small)
 
-        # Post-process
-        np_image = self.segment_post_process(np_image, seg_map)
+            # Post-process -- pass in blur/background so that tf.function
+            # recompiles if we change the args (otherwise it ignores changes
+            # at runtime)
+            np_image = self.segment_post_process(np_image, seg_map,
+                self.blur, self.do_background)
 
-        # Output is expected to be numpy array
-        return np_image.numpy()
+            # Output is expected to be numpy array, though it already is if
+            # we set FLAGS.numpy
+            if FLAGS.numpy:
+                return np_image
+            else:
+                return np_image.numpy()
+
+        # Or, if we don't want to process, just output the frame as is
+        return np_image
 
     def process(self, *args, **kwargs):
         if self.debug:
@@ -635,16 +759,70 @@ class BackgroundReplacement:
 
         return results
 
+    def interaction_check_arg(self, arg):
+        if arg is None:
+            print("Need to pass arg, e.g.: command arg")
+            return False
+
+        return True
+
+    def interaction(self):
+        print("Commands:")
+        print("    p - toggle process")
+        print("    b - toggle background")
+        print("    blur - toggle blur")
+        print("    tint float - set whitebalance tint")
+        print("    temp float - set whitebalance color temperature")
+        print("    size float - set vignette size")
+        print("    soft float - set vignette softness")
+        print("Press Ctrl+C to exit")
+        print()
+        command = input("> ").strip().lower()
+        command = command.split(" ")
+
+        if len(command) == 2:
+            command, arg = command
+        else:
+            command = command[0]
+            arg = None
+
+        if command == "p":
+            self.do_process_frame = not self.do_process_frame
+            # Reset fps
+            self.fps = []
+        elif command == "b":
+            self.do_background = not self.do_background
+        elif command == "blur":
+            self.blur = not self.blur
+        elif command == "tint":
+            if self.interaction_check_arg(arg):
+                self.greentint.set_property("green-tint", float(arg))
+        elif command == "temp":
+            if self.interaction_check_arg(arg):
+                self.colortemp.set_property("color-temperature", float(arg))
+        elif command == "size":
+            if self.interaction_check_arg(arg):
+                self.vignette.set_property("clearcenter", float(arg))
+        elif command == "soft":
+            if self.interaction_check_arg(arg):
+                self.vignette.set_property("soft", float(arg))
+        else:
+            print("Unknown command")
+
     def run(self):
         self.gst_start()
 
-        # Run till Ctrl+C
+        # Run till Ctrl+C, allow changing some options at runtime if desired
         try:
             while True:
-                time.sleep(600)
-        except KeyboardInterrupt:
+                if self.interactive:
+                    self.interaction()
+                else:
+                    time.sleep(600)
+        except (KeyboardInterrupt, EOFError):
             self.exiting = True
             self.gst_stop()
+            print()
 
     def gst_bus_call(self, bus, message, loop):
         """ Print important messages """
@@ -713,10 +891,13 @@ def main(argv):
         "vignette_size": FLAGS.vignette_size,
         "vignette_soft": FLAGS.vignette_soft,
         "blur": FLAGS.blur,
-        "low_latency": FLAGS.low_latency,
+        "latency": FLAGS.latency,
         "background": FLAGS.background,
+        "do_background": FLAGS.do_background,
+        "do_process": FLAGS.do_process,
         "debug": FLAGS.debug,
         "lite": FLAGS.lite,
+        "interactive": FLAGS.interactive,
     }
 
     if FLAGS.filename != "":
